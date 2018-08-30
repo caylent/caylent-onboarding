@@ -2,37 +2,62 @@
 #
 # Purpose: to create AWS users with read-only permissions for auditing.
 # 
-# The script will create a new group with the ReadOnlyAccess policty attached 
+# The script will create a new group with the ReadOnlyAccess policy attached 
 # to it. It also will create 'N' users (according to user input) as members of 
 # the new group and will create custom AWS policies for each one (to allow them 
 # to update their own passwords, access keys and MFAs).
 #
 
+function usage() {
+ echo "  Usage:"
+ echo -e "    $0 [-u=\"user1 user2\"]\n"
+ echo "  Example:"
+ echo -e "    $0 -u=\"john peter\"\n"
+ exit 1
+}
+
+function check_flag() {
+ users="stefan ignacio"
+ if [ $# -ne 0 ]; then
+  for i in "$@"; do
+    case $i in 
+      -u=*|--users=*)
+        users="${i#*=}"
+        ;;
+      *) 
+        usage
+        ;;
+    esac
+  done
+ fi 
+ IFS=' ' read -r -a USER_ARRAY <<< $users 
+}
+
 function validate_aws_cli()
 {
+ # Check AWS CLI is installed 
  if ! type aws > /dev/null 2>&1 ; then
-   echo -e "\e[31mRequirements not met. Install and setup AWS CLI to proceed."
-   echo -e "Get installation instructions from:\e[0m"
-   echo 
-   echo "docs.aws.amazon.com/cli/latest/userguide/installing.html"
-   echo 
+   url="docs.aws.amazon.com/cli/latest/userguide/installing.html"
+   echo -e "\e[31m[ERROR] Requirements not met. Install and setup" \
+   "AWS CLI to proceed."
+   echo -e "Get installation instructions from:\e[0m\n"
+   echo -e "${url}\n"
    exit 1
  fi
 
+ # Check AWS CLI is configured
  if [[ ! -f ~/.aws/config ]]; then
-   echo -e "\e[31mNo AWS profile found. Setup AWS CLI to continue."
-   echo -e "Get setup instructions from:\e[0m"
-   echo 
-   echo "docs.aws.amazon.com/cli/latest/userguide/cli-chap-getting-started.html"
-   echo 
+   url="docs.aws.amazon.com/cli/latest/userguide/cli-chap-getting-started.html"
+   echo -e "\e[31m[ERROR] No AWS profile found. Setup AWS CLI to continue."
+   echo -e "Get setup instructions from:\e[0m\n"
+   echo -e "${url}\n"
    exit 1
  fi
 } 
 
-function set_aws_cli_profile()
+function load_aws_cli_profile()
 {
  read -p "Enter the name of the AWS CLI profile to use [default]: " AWS_PROFILE
- echo
  if [ -z "$AWS_PROFILE" ]; then
    AWS_PROFILE="default"
  fi  
@@ -40,9 +65,8 @@ function set_aws_cli_profile()
  # Check user entered a valid AWS profile
  aws ec2 describe-availability-zones --profile "${AWS_PROFILE}" > /dev/null 2>&1
  if [ $? -ne 0 ]; then
-   echo -e "\e[31mThe profile you entered is not correct." \
-   "Please double check it.\e[0m" 
-   echo 
+   echo -e "\e[31m[ERROR] The profile you entered is not correct." \
+   "Please double check it and try again.\e[0m\n" 
    exit 1
  fi  
 }
@@ -56,8 +80,11 @@ function get_aws_account()
 #### create_aws_group ######
 #
 # A function for creating a new AWS group and attach the AWS policy 
-# 'ReadOnlyAccess' to it. 
+# 'ReadOnlyAccess' to it. It will return exit code 1 if the group exists.
 #
+# Example:
+#   create_aws_group - will create a new AWS user according to user input
+#                      but will fail if the group already exists.
 # Globals:
 #   AWS_PROFILE
 #   AWS_GROUP
@@ -67,36 +94,35 @@ function get_aws_account()
 #   None
 # Exit Code:
 #   0: Success
+#   1: Failure
 #
 #### create_aws_group ######
 function create_aws_group()
 {
-  valid_aws_group=false
+  echo ; read -p "Enter the name of the AWS group to create: " AWS_GROUP
+
+  if [ -z "${AWS_GROUP}" ]; then
+    echo -e "\e[31m[ERROR] Invalid input.\e[0m\n" 
+    exit 1
+  fi  
   
-  while ! ${valid_aws_group}; do
-    read -p "Enter the name of the AWS group to create: " AWS_GROUP
+  aws iam get-group --group-name "${AWS_GROUP}" \
+    --profile "${AWS_PROFILE}" > /dev/null 2>&1
     
-    aws iam get-group --group-name "${AWS_GROUP}" \
+  if [ $? -eq 0 ]; then
+    echo -e "\e[31m[ERROR] Group already exists. Please specify a new one" \
+    "to avoid potentinal issues with your current settings.\e[0m\n" 
+    exit 1
+  else
+    echo "[INFO] Creating AWS group ${AWS_GROUP}..."
+    aws iam create-group --group-name "${AWS_GROUP}" \
       --profile "${AWS_PROFILE}" > /dev/null 2>&1
     
-    if [ $? -eq 0 ]; then
-      echo -e "\e[31mGroup already exists. Please specify a new one to avoid" \
-      "potentinal issues with your current settings.\e[0m" 
-      echo 
-    else
-      echo "Creating AWS group ${AWS_GROUP}..."
-      aws iam create-group --group-name "${AWS_GROUP}" \
-        --profile "${AWS_PROFILE}" > /dev/null 2>&1
-      
-      echo "Attaching ReadOnlyAccess policy to group ${AWS_GROUP}..."
-      echo 
-      aws iam attach-group-policy --group-name "${AWS_GROUP}" \
-        --policy-arn arn:aws:iam::aws:policy/ReadOnlyAccess \
-        --profile "${AWS_PROFILE}" > /dev/null 2>&1
-      
-      valid_aws_group=true
-    fi  
-  done
+    echo -e "[INFO] Attaching ReadOnlyAccess policy to group ${AWS_GROUP}...\n"
+    aws iam attach-group-policy --group-name "${AWS_GROUP}" \
+      --policy-arn arn:aws:iam::aws:policy/ReadOnlyAccess \
+      --profile "${AWS_PROFILE}" > /dev/null 2>&1
+  fi  
 }
 
 function create_aws_policy_document()
@@ -148,11 +174,18 @@ EOF
 #### create_aws_users ######
 #
 # A function for creating 'N' AWS users (according to user input).
-# They are added to the group created by function create_aws_group.
+# If no flag is specified when executing the main script, users 
+# stefan and ignacio are created by default.
+# Users are added to the group created by function create_aws_group.
 # A custom policy (created by function create_aws_policy_document) is attached
 # to each one, for allowing the user to change its password/access keys/MFA.
 #
+# Example:
+# create_aws_users - will create 'N' new AWS users according to what was 
+#                    specified with the flag -u when executing the script
+#
 # Globals:
+#   USER_ARRAY
 #   AWS_PROFILE
 #   AWS_USER
 #   AWS_GROUP
@@ -166,84 +199,68 @@ EOF
 #### create_aws_users ######
 function create_aws_users
 {
-  valid_count=false
+  if [ "${USER_ARRAY[*]}" = "stefan ignacio" ]; then
+    echo -e "[INFO] No users were specified (-u=\"user1 user2\"). Creating"\
+    "Stefan and Ignacio by default...\n"  
+  fi  
 
-  while ! "${valid_count}"; do
-    read -p "Enter the number of AWS users to create: " aws_user_count 
-    if ! [[ "${aws_user_count}" =~ ^[1-9]+$ ]]; then
-      echo -e "\e[31mInvalid input.\e[0m"
-      echo
-    else 
-      echo
-      valid_count=true
-    fi
-  done  
-
-  for count in $(seq 1 "${aws_user_count}"); do 
-    valid_aws_user=false
-    
-    while ! ${valid_aws_user}; do
-      read -p "Enter the name of the AWS user to create ($count): " AWS_USER
-      echo "Creating AWS user ${AWS_USER}..."
-      
-      # Check the AWS user does not exist before creating it
-      aws iam get-user --user-name "${AWS_USER}" \
+  for AWS_USER in ${USER_ARRAY[*]}; do 
+    # Check the AWS user does not exist before creating it
+    aws iam get-user --user-name "${AWS_USER}" \
+      --profile "${AWS_PROFILE}" > /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+      echo -e "[WARNING] Duplicated user: ${AWS_USER} already exists"\
+      "and won't be created. Continuing...\n"
+    else
+      aws iam create-user --user-name "${AWS_USER}" \
         --profile "${AWS_PROFILE}" > /dev/null 2>&1
-      if [ $? -eq 0 ]; then
-        echo -e "\e[31mUser already exists. Please specify another one.\e[0m"
-        echo 
-      else
-        aws iam create-user --user-name "${AWS_USER}" \
-          --profile "${AWS_PROFILE}" > /dev/null 2>&1
       
-        # Check password meet company's Password Policy
-        valid_password=false
-        while ! ${valid_password}; do
-          read -p "Enter the password. User will be prompt to change it: " \
-            aws_user_password
+      # Check password meet company's Password Policy
+      valid_password=false
+      while ! ${valid_password}; do
+        echo -e "[INFO] Creating user ${AWS_USER}"
+        read -p "Enter the password. User will be prompt to change it: " \
+          aws_user_password
           
-          aws iam create-login-profile --user-name "${AWS_USER}" \
-            --password "${aws_user_password}" \
-            --password-reset-required \
-            --profile "${AWS_PROFILE}" > /dev/null 2>&1
+        aws iam create-login-profile --user-name "${AWS_USER}" \
+          --password "${aws_user_password}" \
+          --password-reset-required \
+          --profile "${AWS_PROFILE}" > /dev/null 2>&1
 
-          if [ $? -ne 0 ]; then
-            echo -e "\e[31mPassword doesn't meet company password policy." \
-            "Please try again.\e[0m"
-          else
-            valid_password=true  
-          fi  
-        done
+        if [ $? -ne 0 ]; then
+          echo -e "[WARNING] Password doesn't meet company" \
+          "password policy. Please try again."
+        else
+          valid_password=true  
+        fi  
+      done
 
-        echo "Adding ${AWS_USER} to group ${AWS_GROUP}..."
-        echo 
-        aws iam add-user-to-group --user-name "${AWS_USER}" \
-          --group-name "${AWS_GROUP}" --profile "${AWS_PROFILE}" >/dev/null 2>&1
+      echo -e "[INFO] Adding ${AWS_USER} to group ${AWS_GROUP}..."
+      aws iam add-user-to-group --user-name "${AWS_USER}" \
+        --group-name "${AWS_GROUP}" --profile "${AWS_PROFILE}" >/dev/null 2>&1
         
-        create_aws_policy_document
-        policy_name="allow_change_MFA_and_keys_${AWS_USER}"
-        policy_arn="arn:aws:iam::${AWS_ACCOUNT}:policy/${policy_name}"
+      create_aws_policy_document
+      policy_name="allow_change_MFA_and_keys_${AWS_USER}"
+      policy_arn="arn:aws:iam::${AWS_ACCOUNT}:policy/${policy_name}"
 
-        aws iam create-policy --policy-name "$policy_name" \
-          --policy-document file:///tmp/policy.json \
-          --profile "${AWS_PROFILE}" > /dev/null 2>&1
+      aws iam create-policy --policy-name "$policy_name" \
+        --policy-document file:///tmp/policy.json \
+        --profile "${AWS_PROFILE}" > /dev/null 2>&1
                 
-        aws iam attach-user-policy --user-name "${AWS_USER}" \
-          --policy-arn "${policy_arn}" \
-          --profile "${AWS_PROFILE}" > /dev/null 2>&1
+      aws iam attach-user-policy --user-name "${AWS_USER}" \
+        --policy-arn "${policy_arn}" \
+        --profile "${AWS_PROFILE}" > /dev/null 2>&1
 
-        valid_aws_user=true
-        echo "User ${AWS_USER} successfully created."
-        echo
-      fi  
-    done
+      echo -e "[INFO] User ${AWS_USER} successfully created.\n"
+      rm /tmp/policy.json
+    fi  
   done
-  rm /tmp/policy.json
 }
 
 clear;
+check_flag "$@";
 validate_aws_cli;
-set_aws_cli_profile;
+load_aws_cli_profile;
 get_aws_account;
 create_aws_group;
 create_aws_users;
